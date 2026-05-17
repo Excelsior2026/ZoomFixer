@@ -42,15 +42,23 @@ final class ZoomFixService: ObservableObject {
 
     private func runSequence() async {
         let steps: [(String, () async throws -> Void)] = [
-            ("Kill Zoom processes", killZoomProcesses),
-            ("Clear Zoom cache", clearZoomCache),
-            ("Clear Zoom preferences", clearPreferences),
-            ("Remove Zoom logs", removeLogs),
-            ("Find duplicate installations", findDuplicates),
-            ("Remove all Zoom installations", removeInstallations),
-            ("Download latest Zoom", downloadLatest),
-            ("Install & repair with admin tasks", performPrivilegedInstall),
-            ("Verify installation", verifyInstallation)
+            // ── NEW: system-level change detection & repair ──────────────────
+            ("Check hosts file for Zoom blocks",       repairHostsFile),
+            ("Check macOS firewall for Zoom blocks",   repairFirewallRules),
+            ("Check network interfaces (APIPA/link-local)", repairNetworkInterfaces),
+            ("Check TLS / Keychain trust for Zoom",    checkTLSTrust),
+            ("Check VPN / network extensions",         auditNetworkExtensions),
+            ("Check SIP status",                       checkSIPStatus),
+            // ── existing steps ───────────────────────────────────────────────
+            ("Kill Zoom processes",                    killZoomProcesses),
+            ("Clear Zoom cache",                       clearZoomCache),
+            ("Clear Zoom preferences",                 clearPreferences),
+            ("Remove Zoom logs",                       removeLogs),
+            ("Find duplicate installations",           findDuplicates),
+            ("Remove all Zoom installations",          removeInstallations),
+            ("Download latest Zoom",                   downloadLatest),
+            ("Install & repair with admin tasks",      performPrivilegedInstall),
+            ("Verify installation",                    verifyInstallation)
         ]
 
         for (title, action) in steps {
@@ -67,6 +75,239 @@ final class ZoomFixService: ObservableObject {
         }
 
         await finish()
+    }
+
+    // MARK: - System-change detection & repair (Error 1132)
+
+    /// Zoom error 1132 is often caused by /etc/hosts entries that redirect or
+    /// block Zoom's signalling and relay servers. We scan for known Zoom domains
+    /// and remove any lines that point them at 0.0.0.0 / 127.x / a non-Zoom IP.
+    private func repairHostsFile() async throws {
+        let hostsPath = "/etc/hosts"
+        let zoomDomains = [
+            "zoom.us", "us04web.zoom.us", "us02web.zoom.us",
+            "us06web.zoom.us", "us02ws.zoom.us", "us04ws.zoom.us",
+            "controlplane.zoom.us", "us04mon.zoom.us",
+            "us04stun1.zoom.us", "logcs.zoom.us"
+        ]
+
+        let contents = try String(contentsOfFile: hostsPath, encoding: .utf8)
+        var lines = contents.components(separatedBy: .newlines)
+        var removed: [String] = []
+
+        lines = lines.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.hasPrefix("#"), !trimmed.isEmpty else { return true }
+            let parts = trimmed.split(separator: " ").map(String.init)
+            guard parts.count >= 2 else { return true }
+            let ip = parts[0]
+            let isBlockEntry = ip == "0.0.0.0" || ip.hasPrefix("127.")
+            let hostsZoom = parts.dropFirst().contains(where: { domain in
+                zoomDomains.contains(where: { domain.hasSuffix($0) })
+            })
+            if isBlockEntry && hostsZoom {
+                removed.append(line)
+                return false
+            }
+            return true
+        }
+
+        if removed.isEmpty {
+            await log("[hosts] No Zoom-blocking entries found in /etc/hosts")
+            return
+        }
+
+        await log("[hosts] Found \(removed.count) blocking entry(s) — removing via admin:")
+        for r in removed { await log("  - \(r)") }
+
+        let newContents = lines.joined(separator: "\n")
+        let escaped = newContents
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "'\\''")
+        let script = "bash -lc \"printf '%s' '\(escaped)' > /etc/hosts\""
+        try await shell.run(script, requireAdmin: true)
+        await log("[hosts] Blocking entries removed successfully")
+    }
+
+    /// The macOS Application Firewall can be configured (e.g. by parental
+    /// controls, MDM, or third-party apps) to block ZoomOpener / CptHost.
+    /// We check for blocked entries and remove them, then ensure the
+    /// firewall allows Zoom's binaries.
+    private func repairFirewallRules() async throws {
+        // socketfilterfw manages the built-in Application Firewall
+        let fwPath = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+        guard FileManager.default.fileExists(atPath: fwPath) else {
+            await log("[firewall] socketfilterfw not found — skipping")
+            return
+        }
+
+        let listResult = try await shell.run("\(fwPath) --listapps", allowFailure: true)
+        let output = listResult.output
+
+        let zoomBinaries = [
+            "/Applications/zoom.us.app",
+            "/Applications/Zoom.app",
+            "/Applications/Zoom Workplace.app"
+        ]
+
+        // Look for BLOCK state on any Zoom binary
+        let blockedPattern = #"BLOCK"#
+        let zoomBlocked = zoomBinaries.contains { appPath in
+            output.contains(appPath) && output.range(of: blockedPattern) != nil
+        }
+
+        if !zoomBlocked {
+            await log("[firewall] No Zoom entries blocked in Application Firewall")
+        } else {
+            await log("[firewall] Zoom appears blocked — resetting firewall entries")
+        }
+
+        // Whether blocked or not, ensure Zoom is explicitly unblocked/allowed
+        var cmds: [String] = []
+        for appPath in zoomBinaries {
+            if FileManager.default.fileExists(atPath: appPath) {
+                // Remove old entry then re-add as allowed
+                cmds.append("\(fwPath) --remove \"\(appPath)\" || true")
+                cmds.append("\(fwPath) --add \"\(appPath)\"")
+                cmds.append("\(fwPath) --unblockapp \"\(appPath)\" || true")
+            }
+        }
+
+        if cmds.isEmpty {
+            await log("[firewall] Zoom not yet installed; will re-run after install")
+            return
+        }
+
+        let script = "bash -lc '" + cmds.joined(separator: " && ") + "'"
+        try await shell.run(script, requireAdmin: true)
+        await log("[firewall] Zoom firewall entries updated")
+    }
+
+    /// APIPA / link-local addresses (169.254.x.x) on the primary interface
+    /// indicate DHCP failure and will break Zoom's connectivity (error 1132).
+    /// We detect degraded interfaces and attempt a DHCP renewal.
+    private func repairNetworkInterfaces() async throws {
+        let result = try await shell.run("ifconfig -a", allowFailure: true)
+        let output = result.output
+
+        // Find interfaces with 169.254.x.x
+        let lines = output.components(separatedBy: .newlines)
+        var apipaInterfaces: [String] = []
+        var currentIface = ""
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !line.hasPrefix("\t") && !line.hasPrefix(" ") && line.contains(":") {
+                currentIface = String(line.prefix(while: { $0 != ":" }))
+            }
+            if trimmed.hasPrefix("inet 169.254.") {
+                if !currentIface.isEmpty {
+                    apipaInterfaces.append(currentIface)
+                }
+            }
+        }
+
+        if apipaInterfaces.isEmpty {
+            await log("[network] No APIPA/link-local addresses detected — interfaces look healthy")
+            return
+        }
+
+        await log("[network] APIPA addresses detected on: \(apipaInterfaces.joined(separator: ", "))")
+        await log("[network] Attempting DHCP renewal...")
+
+        for iface in apipaInterfaces {
+            let renewCmd = "ipconfig set \(iface) DHCP"
+            let renewResult = try await shell.run(renewCmd, requireAdmin: true, allowFailure: true)
+            if renewResult.exitCode == 0 {
+                await log("[network] DHCP renewal issued for \(iface)")
+            } else {
+                await log("[network][warn] DHCP renewal failed for \(iface): \(renewResult.output)")
+                hadErrors = true
+            }
+        }
+    }
+
+    /// Validates that zoom.us TLS certificates are trusted by the system
+    /// keychain. A corrupted or enterprise-replaced root CA can break
+    /// Zoom's HTTPS connections and produce error 1132.
+    private func checkTLSTrust() async throws {
+        let checkCmd = """
+        bash -lc 'openssl s_client -connect zoom.us:443 -brief </dev/null 2>&1 | head -5'
+        """
+        let result = try await shell.run(checkCmd, allowFailure: true)
+        let output = result.output
+
+        if output.contains("Verification: OK") || output.contains("verify return:1") {
+            await log("[tls] zoom.us TLS certificate verifies OK")
+            return
+        }
+
+        if output.contains("verification error") || output.contains("unable to verify") {
+            await log("[tls][warn] TLS verification failed for zoom.us: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
+            await log("[tls][warn] This may indicate a tampered root CA or enterprise MITM proxy.")
+            await log("[tls][warn] Recommended action: open Keychain Access → System Roots and check for untrusted / modified certs.")
+            hadErrors = true
+        } else {
+            await log("[tls] zoom.us TLS check result: \(output.prefix(120))")
+        }
+    }
+
+    /// VPN clients and network extensions can intercept Zoom's UDP relay
+    /// traffic (ports 8801–8802, 3478, 3479) causing error 1132.
+    /// We list loaded network kernel extensions as an advisory.
+    private func auditNetworkExtensions() async throws {
+        // Check for loaded network extensions via systemextensionsctl
+        let sysextResult = try await shell.run(
+            "systemextensionsctl list 2>/dev/null || echo 'unavailable'",
+            allowFailure: true
+        )
+
+        let kextResult = try await shell.run(
+            "kextstat 2>/dev/null | grep -i -E 'vpn|tunnel|filter|proxy|checkpoint|sophos|symantec|mcafee|crowdstrike|carbon' || echo 'none'",
+            allowFailure: true
+        )
+
+        let kextOutput = kextResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if kextOutput == "none" || kextOutput.isEmpty {
+            await log("[netext] No known VPN/security kernel extensions detected")
+        } else {
+            await log("[netext][warn] Potentially interfering network extensions found:")
+            for line in kextOutput.components(separatedBy: .newlines) where !line.isEmpty {
+                await log("  \(line)")
+            }
+            await log("[netext][warn] If Zoom error 1132 persists, try disabling VPN/security software and retesting.")
+        }
+
+        let sysextOutput = sysextResult.output
+        if sysextOutput.contains("com.apple") || sysextOutput == "unavailable" {
+            // Only Apple extensions — fine
+        } else {
+            let thirdParty = sysextOutput.components(separatedBy: .newlines)
+                .filter { !$0.contains("com.apple") && !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            if !thirdParty.isEmpty {
+                await log("[netext][info] Third-party system extensions active:")
+                for line in thirdParty { await log("  \(line)") }
+            }
+        }
+    }
+
+    /// SIP (System Integrity Protection) being disabled can allow
+    /// malicious software to tamper with Zoom's install, causing 1132.
+    /// We report the SIP state and advise re-enabling if off.
+    private func checkSIPStatus() async throws {
+        let result = try await shell.run("csrutil status", allowFailure: true)
+        let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if output.contains("enabled") {
+            await log("[sip] System Integrity Protection is ENABLED ✓")
+        } else if output.contains("disabled") {
+            await log("[sip][warn] System Integrity Protection is DISABLED.")
+            await log("[sip][warn] SIP being off allows deep system modifications that can break Zoom.")
+            await log("[sip][warn] To re-enable: boot into Recovery Mode → Utilities → Terminal → `csrutil enable`")
+            hadErrors = true
+        } else {
+            await log("[sip] SIP status: \(output)")
+        }
     }
 
     // MARK: - Docker sandbox
@@ -307,7 +548,7 @@ final class ZoomFixService: ObservableObject {
         """
     }
 
-    // MARK: - Steps
+    // MARK: - Existing Steps
 
     private func killZoomProcesses() async throws {
         try await shell.run("pkill -9 -f 'zoom.us' || true")
@@ -423,9 +664,21 @@ final class ZoomFixService: ObservableObject {
         """
         commands.append(perms)
 
+        // Re-unblock in firewall after fresh install
+        let fwPath = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+        let fwUnblock = """
+        for app in "/Applications/zoom.us.app" "/Applications/Zoom.app" "/Applications/Zoom Workplace.app"; do
+          if [ -d "$app" ]; then
+            \(fwPath) --add "$app" 2>/dev/null || true
+            \(fwPath) --unblockapp "$app" 2>/dev/null || true
+          fi
+        done
+        """
+        commands.append(fwUnblock)
+
         let script = "bash -lc 'set -e; \(commands.joined(separator: " && "))'"
         try await shell.run(script, requireAdmin: true)
-        await log("Admin tasks completed (remove/install/permissions/DNS flush)")
+        await log("Admin tasks completed (remove/install/permissions/DNS flush/firewall)")
     }
 
     private func verifyInstallation() async throws {
