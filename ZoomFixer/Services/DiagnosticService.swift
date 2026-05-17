@@ -1,235 +1,210 @@
 import Foundation
 
-/// Runs a scan-only diagnostic pass and returns a report without
-/// modifying any system state.
+/// Standalone diagnostic-only scans that do not modify the system.
+/// Used by the "Scan Only" path in the UI.
 final class DiagnosticService: ObservableObject {
-    @Published private(set) var isRunning = false
-    @Published private(set) var entries: [LogEntry] = []
-    @Published private(set) var probeResults: [NetworkProbeService.ProbeResult] = []
+    @Published private(set) var isScanning = false
+    @Published private(set) var results: [DiagnosticResult] = []
 
     private let shell = ShellExecutor()
-    private let probe = NetworkProbeService()
 
-    // MARK: - Public
+    struct DiagnosticResult: Identifiable {
+        let id = UUID()
+        let title: String
+        let status: Status
+        let detail: String
 
-    func runDiagnostic() {
-        guard !isRunning else { return }
+        enum Status { case ok, warn, fail }
+    }
+
+    func runScan() {
+        guard !isScanning else { return }
         Task {
-            await MainActor.run { self.isRunning = true; self.entries = [] }
+            await MainActor.run { self.isScanning = true; self.results = [] }
+            var r: [DiagnosticResult] = []
 
-            let logger: (LogEntry) -> Void = { entry in
-                Task { @MainActor in self.entries.append(entry) }
-            }
+            r.append(await checkHostsFile())
+            r.append(await checkFirewall())
+            r.append(await checkNetworkInterfaces())
+            r.append(await checkPortReachability())
+            r.append(await checkProxy())
+            r.append(await checkMTU())
+            r.append(await checkTLS())
+            r.append(await checkSIP())
+            r.append(await checkNetworkExtensions())
+            r.append(await checkLaunchAgents())
+            r.append(await checkCrashLogs())
+            r.append(await checkMACAddress())
 
-            logger(LogEntry(level: .info, category: "scan", message: "=== ZoomFixer Diagnostic Scan ==="))
-
-            await checkHostsReadOnly(logger: logger)
-            await checkFirewallReadOnly(logger: logger)
-            await checkNetworkInterfacesReadOnly(logger: logger)
-            await checkTLSReadOnly(logger: logger)
-            await checkProxySettings(logger: logger)
-            await checkMDNS(logger: logger)
-            await checkMTU(logger: logger)
-            await checkLaunchAgents(logger: logger)
-            await checkCrashLogs(logger: logger)
-            await checkSIPReadOnly(logger: logger)
-            await checkVPNExtensions(logger: logger)
-
-            let results = await probe.probeAll(logger: logger)
-            await MainActor.run { self.probeResults = results }
-
-            logger(LogEntry(level: .info, category: "scan", message: "=== Scan complete ==="))
-            await MainActor.run { self.isRunning = false }
+            await MainActor.run { self.results = r; self.isScanning = false }
         }
     }
 
-    // MARK: - Read-only checks
+    // MARK: - Individual checks
 
-    private func checkHostsReadOnly(logger: (LogEntry) -> Void) async {
-        let zoomDomains = ["zoom.us","us04web.zoom.us","us02web.zoom.us","controlplane.zoom.us"]
-        guard let contents = try? String(contentsOfFile: "/etc/hosts", encoding: .utf8) else {
-            logger(LogEntry(level: .warn, category: "hosts", message: "Cannot read /etc/hosts")); return
-        }
-        var found = false
-        for line in contents.components(separatedBy: .newlines) {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            guard !t.hasPrefix("#"), !t.isEmpty else { continue }
-            let parts = t.split(separator: " ").map(String.init)
-            guard parts.count >= 2 else { continue }
-            let ip = parts[0]
-            if (ip == "0.0.0.0" || ip.hasPrefix("127.")) &&
-               parts.dropFirst().contains(where: { d in zoomDomains.contains(where: { d.hasSuffix($0) }) }) {
-                logger(LogEntry(level: .warn, category: "hosts", message: "BLOCKING entry: \(line)"))
-                found = true
+    private func checkHostsFile() async -> DiagnosticResult {
+        let zoomDomains = ["zoom.us", "us04web.zoom.us", "us02web.zoom.us",
+                           "controlplane.zoom.us", "logcs.zoom.us"]
+        let contents = (try? String(contentsOfFile: "/etc/hosts", encoding: .utf8)) ?? ""
+        let blocked = zoomDomains.filter { domain in
+            contents.components(separatedBy: .newlines).contains { line in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                guard !t.hasPrefix("#") else { return false }
+                return (t.hasPrefix("0.0.0.0") || t.contains("127.")) && t.contains(domain)
             }
         }
-        if !found { logger(LogEntry(level: .info, category: "hosts", message: "No Zoom-blocking entries in /etc/hosts ✓")) }
+        if blocked.isEmpty {
+            return .init(title: "Hosts file", status: .ok, detail: "No Zoom domains blocked")
+        }
+        return .init(title: "Hosts file", status: .fail,
+                     detail: "Blocking entries found: \(blocked.joined(separator: ", "))")
     }
 
-    private func checkFirewallReadOnly(logger: (LogEntry) -> Void) async {
+    private func checkFirewall() async -> DiagnosticResult {
         let fw = "/usr/libexec/ApplicationFirewall/socketfilterfw"
         guard FileManager.default.fileExists(atPath: fw) else {
-            logger(LogEntry(level: .info, category: "firewall", message: "socketfilterfw not present — skipping")); return
+            return .init(title: "Firewall", status: .ok, detail: "socketfilterfw not present")
         }
-        let r = try? await shell.run("\(fw) --listapps", allowFailure: true)
-        let out = r?.output ?? ""
-        let hasZoom = out.contains("zoom") || out.contains("Zoom")
-        logger(LogEntry(
-            level: hasZoom ? .info : .warn,
-            category: "firewall",
-            message: hasZoom ? "Zoom found in firewall list" : "Zoom not found in firewall application list"
-        ))
+        let res = (try? await shell.run("\(fw) --listapps", allowFailure: true))?.output ?? ""
+        let zoomApps = ["/Applications/zoom.us.app", "/Applications/Zoom.app"]
+        let blocked = zoomApps.filter { app in res.contains(app) && res.contains("BLOCK") }
+        if blocked.isEmpty {
+            return .init(title: "Firewall", status: .ok, detail: "No Zoom binaries blocked")
+        }
+        return .init(title: "Firewall", status: .fail,
+                     detail: "Blocked: \(blocked.joined(separator: ", "))")
     }
 
-    private func checkNetworkInterfacesReadOnly(logger: (LogEntry) -> Void) async {
-        let r = try? await shell.run("ifconfig -a", allowFailure: true)
-        let out = r?.output ?? ""
-        let hasAPIPA = out.contains("inet 169.254.")
-        logger(LogEntry(
-            level: hasAPIPA ? .warn : .info,
-            category: "network",
-            message: hasAPIPA ? "APIPA address detected — DHCP may have failed" : "Network interfaces look healthy ✓"
-        ))
+    private func checkNetworkInterfaces() async -> DiagnosticResult {
+        let res = (try? await shell.run("ifconfig -a", allowFailure: true))?.output ?? ""
+        let apipa = res.components(separatedBy: .newlines).filter { $0.contains("inet 169.254.") }
+        if apipa.isEmpty {
+            return .init(title: "Network interfaces", status: .ok, detail: "No APIPA addresses detected")
+        }
+        return .init(title: "Network interfaces", status: .fail,
+                     detail: "APIPA (DHCP failure) detected on \(apipa.count) interface(s)")
     }
 
-    private func checkTLSReadOnly(logger: (LogEntry) -> Void) async {
-        let r = try? await shell.run(
+    private func checkPortReachability() async -> DiagnosticResult {
+        // TCP reachability to Zoom signalling servers
+        let targets = [("us04web.zoom.us", 443), ("controlplane.zoom.us", 443)]
+        var failed: [String] = []
+        for (host, port) in targets {
+            let cmd = "nc -z -w 5 \(host) \(port) 2>&1"
+            let res = (try? await shell.run(cmd, allowFailure: true))
+            if (res?.exitCode ?? 1) != 0 {
+                failed.append("\(host):\(port)")
+            }
+        }
+        if failed.isEmpty {
+            return .init(title: "Port reachability", status: .ok,
+                         detail: "Zoom signalling ports reachable")
+        }
+        return .init(title: "Port reachability", status: .fail,
+                     detail: "Unreachable: \(failed.joined(separator: ", "))")
+    }
+
+    private func checkProxy() async -> DiagnosticResult {
+        let res = (try? await shell.run("scutil --proxy", allowFailure: true))?.output ?? ""
+        let hasProxy = res.contains("HTTPEnable = 1") || res.contains("HTTPSEnable = 1")
+            || res.contains("ProxyAutoConfigEnable = 1")
+        if !hasProxy {
+            return .init(title: "Proxy settings", status: .ok, detail: "No system proxy configured")
+        }
+        let summary = res.components(separatedBy: .newlines)
+            .filter { $0.contains("Enable") || $0.contains("Proxy") || $0.contains("PAC") }
+            .joined(separator: "; ")
+        return .init(title: "Proxy settings", status: .warn,
+                     detail: "Active proxy detected: \(summary)")
+    }
+
+    private func checkMTU() async -> DiagnosticResult {
+        // Get primary interface
+        let routeRes = (try? await shell.run("route get default 2>/dev/null | awk '/interface/{print $2}'", allowFailure: true))?.output.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !routeRes.isEmpty else {
+            return .init(title: "MTU", status: .warn, detail: "Could not determine primary interface")
+        }
+        let mtuRes = (try? await shell.run("networksetup -getMTU \"\(routeRes)\" 2>/dev/null || ifconfig \(routeRes) | awk '/mtu/{print $NF}'", allowFailure: true))?.output ?? ""
+        let digits = mtuRes.components(separatedBy: .whitespaces).compactMap { Int($0) }.first ?? 0
+        if digits == 0 {
+            return .init(title: "MTU", status: .warn, detail: "Could not read MTU for \(routeRes)")
+        }
+        if digits < 1400 {
+            return .init(title: "MTU", status: .fail,
+                         detail: "MTU is \(digits) on \(routeRes) — below 1400, may cause Zoom packet loss")
+        }
+        return .init(title: "MTU", status: .ok, detail: "MTU = \(digits) on \(routeRes)")
+    }
+
+    private func checkTLS() async -> DiagnosticResult {
+        let res = (try? await shell.run(
             "openssl s_client -connect zoom.us:443 -brief </dev/null 2>&1 | head -5",
-            allowFailure: true
-        )
-        let out = r?.output ?? ""
-        if out.contains("Verification: OK") || out.contains("verify return:1") {
-            logger(LogEntry(level: .info, category: "tls", message: "zoom.us TLS certificate verifies OK ✓"))
-        } else {
-            logger(LogEntry(level: .warn, category: "tls", message: "TLS verification issue: \(out.prefix(120))"))
+            allowFailure: true))?.output ?? ""
+        if res.contains("Verification: OK") || res.contains("verify return:1") {
+            return .init(title: "TLS / Keychain trust", status: .ok, detail: "zoom.us TLS cert OK")
         }
+        return .init(title: "TLS / Keychain trust", status: .warn,
+                     detail: "TLS issue: \(res.prefix(120))")
     }
 
-    private func checkProxySettings(logger: (LogEntry) -> Void) async {
-        let r = try? await shell.run("scutil --proxy", allowFailure: true)
-        let out = r?.output ?? ""
-        if out.contains("HTTPEnable : 1") || out.contains("HTTPSEnable : 1") || out.contains("ProxyAutoConfigEnable : 1") {
-            logger(LogEntry(level: .warn, category: "proxy",
-                message: "System proxy is ENABLED. This may intercept Zoom traffic.\n\(out.prefix(300))"))
-        } else {
-            logger(LogEntry(level: .info, category: "proxy", message: "No system proxy detected ✓"))
+    private func checkSIP() async -> DiagnosticResult {
+        let res = (try? await shell.run("csrutil status", allowFailure: true))?.output ?? ""
+        if res.contains("enabled") {
+            return .init(title: "SIP", status: .ok, detail: "System Integrity Protection enabled")
         }
-        // Also check environment variables
-        for key in ["HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy"] {
-            if let val = ProcessInfo.processInfo.environment[key], !val.isEmpty {
-                logger(LogEntry(level: .warn, category: "proxy", message: "Env var \(key)=\(val)"))
-            }
-        }
+        return .init(title: "SIP", status: .warn, detail: "SIP disabled — system may be tampered")
     }
 
-    private func checkMDNS(logger: (LogEntry) -> Void) async {
-        let r = try? await shell.run("pgrep -x mDNSResponder", allowFailure: true)
-        if r?.exitCode == 0 {
-            logger(LogEntry(level: .info, category: "mdns", message: "mDNSResponder is running ✓"))
-        } else {
-            logger(LogEntry(level: .warn, category: "mdns", message: "mDNSResponder is NOT running — Zoom peer discovery may fail"))
+    private func checkNetworkExtensions() async -> DiagnosticResult {
+        let res = (try? await shell.run(
+            "kextstat 2>/dev/null | grep -iE 'vpn|tunnel|filter|proxy|checkpoint|sophos|symantec|mcafee|crowdstrike|carbon' || echo ''",
+            allowFailure: true))?.output.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if res.isEmpty {
+            return .init(title: "Network extensions", status: .ok,
+                         detail: "No known interfering VPN/security kexts")
         }
+        let count = res.components(separatedBy: .newlines).filter { !$0.isEmpty }.count
+        return .init(title: "Network extensions", status: .warn,
+                     detail: "\(count) potentially interfering extension(s) loaded")
     }
 
-    private func checkMTU(logger: (LogEntry) -> Void) async {
-        let ifaces = ["en0","en1","utun0"]
-        for iface in ifaces {
-            let r = try? await shell.run("networksetup -getMTU \(iface) 2>/dev/null", allowFailure: true)
-            let out = (r?.output ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !out.isEmpty, r?.exitCode == 0 else { continue }
-            if let mtuStr = out.components(separatedBy: " ").last, let mtu = Int(mtuStr) {
-                if mtu < 1400 {
-                    logger(LogEntry(level: .warn, category: "mtu",
-                        message: "\(iface) MTU=\(mtu) is low (<1400) — may cause Zoom packet fragmentation"))
-                } else {
-                    logger(LogEntry(level: .info, category: "mtu", message: "\(iface) MTU=\(mtu) ✓"))
-                }
-            }
-        }
-    }
-
-    private func checkLaunchAgents(logger: (LogEntry) -> Void) async {
-        let dirs = [
+    private func checkLaunchAgents() async -> DiagnosticResult {
+        let paths = [
             "\(NSHomeDirectory())/Library/LaunchAgents",
-            "/Library/LaunchAgents",
             "/Library/LaunchDaemons"
         ]
-        var found = false
-        for dir in dirs {
-            guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
-            for file in files where file.lowercased().contains("zoom") {
-                logger(LogEntry(level: .warn, category: "launchd",
-                    message: "Zoom LaunchAgent/Daemon found: \(dir)/\(file)"))
-                found = true
-            }
+        var found: [String] = []
+        for path in paths {
+            let items = (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
+            found += items.filter { $0.lowercased().contains("zoom") }
         }
-        if !found { logger(LogEntry(level: .info, category: "launchd", message: "No Zoom LaunchAgents/Daemons found ✓")) }
+        if found.isEmpty {
+            return .init(title: "LaunchAgents/Daemons", status: .ok,
+                         detail: "No Zoom-related launch agents found")
+        }
+        return .init(title: "LaunchAgents/Daemons", status: .warn,
+                     detail: "Found: \(found.joined(separator: ", "))")
     }
 
-    private func checkCrashLogs(logger: (LogEntry) -> Void) async {
-        let crashDir = "\(NSHomeDirectory())/Library/Logs/DiagnosticReports"
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: crashDir) else {
-            logger(LogEntry(level: .info, category: "crash", message: "No diagnostic reports directory found")); return
+    private func checkCrashLogs() async -> DiagnosticResult {
+        let dir = "\(NSHomeDirectory())/Library/Logs/DiagnosticReports"
+        let items = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        let crashes = items.filter { $0.lowercased().contains("zoom") && $0.hasSuffix(".crash") }
+        if crashes.isEmpty {
+            return .init(title: "Crash logs", status: .ok, detail: "No recent Zoom crash reports")
         }
-        let zoomCrashes = files.filter { $0.lowercased().contains("zoom") }.sorted().suffix(5)
-        if zoomCrashes.isEmpty {
-            logger(LogEntry(level: .info, category: "crash", message: "No recent Zoom crash reports ✓"))
-        } else {
-            logger(LogEntry(level: .warn, category: "crash", message: "Recent Zoom crash reports:"))
-            for f in zoomCrashes {
-                let path = "\(crashDir)/\(f)"
-                // Extract just the exception line
-                if let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                    let exception = content.components(separatedBy: .newlines)
-                        .first(where: { $0.contains("Exception") || $0.contains("Signal") })
-                        ?? "(no exception line found)"
-                    logger(LogEntry(level: .warn, category: "crash", message: "  \(f): \(exception)"))
-                }
-            }
-        }
+        return .init(title: "Crash logs", status: .warn,
+                     detail: "\(crashes.count) crash report(s) found — may indicate install corruption")
     }
 
-    private func checkSIPReadOnly(logger: (LogEntry) -> Void) async {
-        let r = try? await shell.run("csrutil status", allowFailure: true)
-        let out = (r?.output ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if out.contains("enabled") {
-            logger(LogEntry(level: .info, category: "sip", message: "SIP is ENABLED ✓"))
-        } else if out.contains("disabled") {
-            logger(LogEntry(level: .warn, category: "sip",
-                message: "SIP is DISABLED — system files can be tampered with"))
-        } else {
-            logger(LogEntry(level: .info, category: "sip", message: "SIP: \(out)"))
+    private func checkMACAddress() async -> DiagnosticResult {
+        let res = (try? await shell.run(
+            "ifconfig en0 2>/dev/null | awk '/ether/{print $2}'",
+            allowFailure: true))?.output.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if res.isEmpty {
+            return .init(title: "MAC address (en0)", status: .warn, detail: "Could not read en0 MAC")
         }
-    }
-
-    private func checkVPNExtensions(logger: (LogEntry) -> Void) async {
-        let r = try? await shell.run(
-            "kextstat 2>/dev/null | grep -iE 'vpn|tunnel|filter|proxy|checkpoint|sophos|symantec|mcafee|crowdstrike|carbon' || echo ''",
-            allowFailure: true
-        )
-        let out = (r?.output ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if out.isEmpty {
-            logger(LogEntry(level: .info, category: "netext", message: "No interfering VPN/security kexts detected ✓"))
-        } else {
-            logger(LogEntry(level: .warn, category: "netext", message: "Potentially interfering kexts: \(out.prefix(200))"))
-        }
-    }
-
-    // MARK: - Report export
-
-    func exportReport() -> String {
-        let header = "ZoomFixer Diagnostic Report — \(Date())\n" + String(repeating: "=", count: 60) + "\n"
-        let body = entries.map { $0.formatted }.joined(separator: "\n")
-        return header + body
-    }
-
-    func saveReportToDesktop() -> URL? {
-        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first!
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let name = "ZoomFixer_Report_\(formatter.string(from: Date())).txt"
-        let url = desktop.appendingPathComponent(name)
-        try? exportReport().write(to: url, atomically: true, encoding: .utf8)
-        return url
+        return .init(title: "MAC address (en0)", status: .ok,
+                     detail: "Current MAC: \(res)")
     }
 }
