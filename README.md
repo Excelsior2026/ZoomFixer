@@ -1,5 +1,7 @@
 # ZoomFixer (macOS)
 
+_A BagelTech project._
+
 Native SwiftUI helper that walks through the common fixes for Zoom error 1132: clearing caches, removing duplicates, resetting DNS, downloading the latest installer, and reinstalling Zoom with repaired permissions.
 
 ## Project layout
