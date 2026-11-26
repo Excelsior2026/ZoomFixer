@@ -6,7 +6,56 @@ struct ShellResult {
     let exitCode: Int32
 }
 
-struct ShellExecutor {
+/// Tracks child processes so a repair run can be cancelled while a command
+/// is still executing. The flag is checked immediately after registration to
+/// close the gap between a user tapping Cancel and a command being launched.
+final class ProcessRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active: [UUID: Process] = [:]
+    private var cancelRequested = false
+
+    @discardableResult
+    func register(_ process: Process) -> UUID {
+        let id = UUID()
+        lock.lock()
+        active[id] = process
+        lock.unlock()
+        return id
+    }
+
+    func unregister(_ id: UUID) {
+        lock.lock()
+        active.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    var isCancellationRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelRequested
+    }
+
+    /// Called at the start of each run so a previous cancellation cannot
+    /// terminate the next run's commands.
+    func reset() {
+        lock.lock()
+        cancelRequested = false
+        lock.unlock()
+    }
+
+    func cancelAll() {
+        lock.lock()
+        cancelRequested = true
+        let processes = Array(active.values)
+        lock.unlock()
+
+        for process in processes where process.isRunning {
+            process.terminate()
+        }
+    }
+}
+
+struct ShellExecutor: Sendable {
     enum ShellError: LocalizedError {
         case commandFailed(command: String, code: Int32, output: String)
 
@@ -16,6 +65,12 @@ struct ShellExecutor {
                 return "\(command) failed with code \(code): \(output)"
             }
         }
+    }
+
+    let registry: ProcessRegistry
+
+    init(registry: ProcessRegistry = ProcessRegistry()) {
+        self.registry = registry
     }
 
     func run(
@@ -93,8 +148,17 @@ struct ShellExecutor {
         }
 
         try process.run()
+        let token = registry.register(process)
+        defer {
+            registry.unregister(token)
+            pipe.fileHandleForReading.readabilityHandler = nil
+        }
+        // Cancellation may have arrived between the run-sequence check and
+        // process launch; do not let that command keep mutating the system.
+        if registry.isCancellationRequested && process.isRunning {
+            process.terminate()
+        }
         process.waitUntilExit()
-        pipe.fileHandleForReading.readabilityHandler = nil
 
         lock.lock()
         let output = String(data: collected, encoding: .utf8) ?? ""

@@ -2,6 +2,55 @@ import Foundation
 import Combine
 import AppKit
 
+/// One read-only, human-readable line in the preflight preview. Nothing in
+/// this model is applied until the user explicitly confirms.
+struct FixPreviewItem: Identifiable {
+    enum Kind: String {
+        case file = "File"
+        case process = "Process"
+        case setting = "Setting"
+        case download = "Download"
+    }
+
+    let id = UUID()
+    let kind: Kind
+    let target: String
+    let detail: String
+}
+
+enum StepResultState: String {
+    case ok
+    case failed
+    case cancelled
+    case skipped
+}
+
+/// What actually happened to one step of a confirmed run.
+struct StepResult: Identifiable {
+    let id = UUID()
+    let title: String
+    let state: StepResultState
+    let detail: String
+}
+
+enum FixOutcomeState: String {
+    case completed = "Completed"
+    case completedWithWarnings = "Completed with warnings"
+    case cancelled = "Cancelled"
+    case failed = "Failed"
+}
+
+/// Post-action report built from recorded step results, not from intent.
+struct FixOutcome {
+    let state: FixOutcomeState
+    let summary: String
+    let results: [StepResult]
+    let warnings: [String]
+
+    var failures: [StepResult] { results.filter { $0.state == .failed } }
+    var skipped: [StepResult] { results.filter { $0.state == .skipped || $0.state == .cancelled } }
+}
+
 final class ZoomFixService: ObservableObject {
     enum StatusKind {
         case idle
@@ -21,25 +70,200 @@ final class ZoomFixService: ObservableObject {
     @Published private(set) var isLaunchingDocker = false
     @Published private(set) var isInstallingDocker = false
     @Published private(set) var isAutoDockerFlow = false
+    @Published private(set) var previewItems: [FixPreviewItem] = []
+    @Published private(set) var isPreparingPreview = false
+    @Published private(set) var isConfirmationPending = false
+    @Published private(set) var cancellationRequested = false
+    @Published private(set) var lastOutcome: FixOutcome? = nil
 
-    private let shell = ShellExecutor()
+    private let processRegistry = ProcessRegistry()
+    private let shell: ShellExecutor
     private let downloader = DownloadService()
     private var discoveredInstallations: [URL] = []
     private var adminInstallationPaths: [URL] = []
     private var installerURL: URL?
     private var hadErrors = false
+    private var isCancellationRequested = false
 
-    func startFix() {
-        guard !isRunning else { return }
+    init() {
+        shell = ShellExecutor(registry: processRegistry)
+    }
+
+    // MARK: - Preflight, confirmation and cancellation
+
+    /// Read-only first step: inspect the machine and describe every change the
+    /// repair would make. No shell command issued here mutates system state.
+    @MainActor
+    func prepareFixPreview() {
+        guard !isRunning, !isPreparingPreview else { return }
+        processRegistry.reset()
+        isPreparingPreview = true
+        isConfirmationPending = false
+        previewItems = []
+        lastOutcome = nil
+        cancellationRequested = false
+
+        Task { await buildPreview() }
+    }
+
+    @MainActor
+    private func buildPreview() async {
+        var items: [FixPreviewItem] = []
+
+        // /etc/hosts — the same detector used by repairHostsFile().
+        let hosts = await readOnlyOutput("cat /etc/hosts 2>/dev/null || true")
+        let blockedLines = zoomBlockingHostLines(in: hosts)
+        if !blockedLines.isEmpty {
+            items.append(FixPreviewItem(
+                kind: .file,
+                target: "/etc/hosts",
+                detail: "Remove \(blockedLines.count) Zoom-blocking line(s): \(blockedLines.joined(separator: " | ")) (admin)"
+            ))
+        }
+
+        // Application Firewall entries for installed Zoom binaries.
+        let zoomBinaries = zoomApplicationCandidates()
+        let installedBinaries = zoomBinaries.filter { FileManager.default.fileExists(atPath: $0) }
+        if !installedBinaries.isEmpty {
+            items.append(FixPreviewItem(
+                kind: .setting,
+                target: "macOS Application Firewall",
+                detail: "Remove/re-add and unblock: \(installedBinaries.joined(separator: ", ")) (admin)"
+            ))
+        }
+
+        // DHCP renewal for degraded interfaces.
+        let interfaces = apipaInterfaces(in: await readOnlyOutput("ifconfig -a 2>/dev/null || true"))
+        for iface in interfaces {
+            items.append(FixPreviewItem(
+                kind: .setting,
+                target: "Network interface \(iface)",
+                detail: "Renew DHCP lease with `ipconfig set \(iface) DHCP` (admin)"
+            ))
+        }
+
+        // Running Zoom processes.
+        let processOutput = await readOnlyOutput("pgrep -fl 'zoom.us' 2>/dev/null || true")
+        let zoomProcesses = processOutput.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if !zoomProcesses.isEmpty {
+            items.append(FixPreviewItem(
+                kind: .process,
+                target: "Running Zoom processes",
+                detail: "Force quit: \(zoomProcesses.joined(separator: " | "))"
+            ))
+        }
+
+        // User-level files that will be deleted.
+        let home = NSHomeDirectory()
+        let cachePath = "\(home)/Library/Application Support/zoom.us"
+        if FileManager.default.fileExists(atPath: cachePath) {
+            items.append(FixPreviewItem(kind: .file, target: cachePath, detail: "Delete Zoom cache directory"))
+        }
+        let logPath = "\(home)/Library/Logs/zoom.us"
+        if FileManager.default.fileExists(atPath: logPath) {
+            items.append(FixPreviewItem(kind: .file, target: logPath, detail: "Delete Zoom logs directory"))
+        }
+        let preferenceOutput = await readOnlyOutput("printf '%s\\n' \"$HOME\"/Library/Preferences/us.zoom.* 2>/dev/null || true")
+        let preferences = preferenceOutput.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { FileManager.default.fileExists(atPath: $0) }
+        for path in preferences {
+            items.append(FixPreviewItem(kind: .file, target: path, detail: "Delete Zoom preference file"))
+        }
+
+        // Installed copies, using the same discovery command as findDuplicates().
+        let foundPaths = await readOnlyOutput(zoomInstallationDiscoveryCommand())
+        let installations = Array(Set(foundPaths.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .map { URL(fileURLWithPath: $0) }))
+        for url in installations {
+            let privileged = url.path.hasPrefix("/Applications")
+            items.append(FixPreviewItem(
+                kind: .file,
+                target: url.path,
+                detail: privileged ? "Remove existing admin-level copy (admin)" : "Remove existing user-level copy"
+            ))
+        }
+
+        items.append(FixPreviewItem(
+            kind: .download,
+            target: "https://zoom.us/client/latest/Zoom.pkg",
+            detail: "Download the latest Zoom installer to a temporary .pkg file"
+        ))
+        items.append(FixPreviewItem(
+            kind: .file,
+            target: "/Applications (Zoom application bundle)",
+            detail: "Install the downloaded package; replace Zoom.app bundles found above"
+        ))
+        items.append(FixPreviewItem(
+            kind: .setting,
+            target: "System settings touched by the privileged step",
+            detail: "Set root:wheel / 755 on Zoom bundles, flush DNS cache, restart mDNSResponder, re-add/unblock firewall entries (admin)"
+        ))
+
+        previewItems = items
+        isPreparingPreview = false
+        isConfirmationPending = true
+        log("[preview] \(items.count) planned change(s) listed; nothing has been changed yet")
+        updateStatus(message: "Review the preview before continuing", kind: .idle)
+    }
+
+    /// Executes only after the user has seen the preview and pressed Confirm.
+    @MainActor
+    func confirmFix() {
+        guard isConfirmationPending, !isRunning else { return }
+        isConfirmationPending = false
+        previewItems = []
 
         Task {
-            await prepareForRun()
+            prepareForRun()
             await runSequence()
+        }
+    }
+
+    @MainActor
+    func cancelPreview() {
+        guard isConfirmationPending else { return }
+        isConfirmationPending = false
+        previewItems = []
+        statusMessage = "Preview cancelled; no changes made"
+        statusKind = .idle
+    }
+
+    /// Requests cancellation of an in-flight run and terminates any child
+    /// process tracked by the shared shell registry.
+    @MainActor
+    func cancelFix() {
+        guard isRunning else { return }
+        isCancellationRequested = true
+        cancellationRequested = true
+        processRegistry.cancelAll()
+        logs.append("[cancel] Cancellation requested; stopping active command")
+        statusMessage = "Cancelling repair..."
+        statusKind = .warning
+        progressLabel = "Cancelling"
+    }
+
+    @MainActor
+    func clearOutcome() {
+        lastOutcome = nil
+    }
+
+    @MainActor
+    private func readOnlyOutput(_ command: String) async -> String {
+        do {
+            return (try await shell.run(command, allowFailure: true)).output
+        } catch {
+            return ""
         }
     }
 
     // MARK: - Sequence
 
+    @MainActor
     private func runSequence() async {
         let steps: [(String, () async throws -> Void)] = [
             // ── NEW: system-level change detection & repair ──────────────────
@@ -61,20 +285,92 @@ final class ZoomFixService: ObservableObject {
             ("Verify installation",                    verifyInstallation)
         ]
 
+        var results: [StepResult] = []
+
         for (title, action) in steps {
-            await updateStatus(message: title, kind: .running)
-            await log("== \(title) ==")
+            if isCancellationRequested {
+                results.append(StepResult(title: title, state: .skipped, detail: "Not started; cancelled"))
+                log("[cancel] Skipped \(title)")
+                continue
+            }
+
+            updateStatus(message: title, kind: .running)
+            log("== \(title) ==")
 
             do {
                 try await action()
-                await log("[ok] \(title)")
+
+                if isCancellationRequested {
+                    results.append(StepResult(title: title, state: .cancelled, detail: "Interrupted by cancellation; partial effects may remain"))
+                    log("[cancel] \(title): interrupted by cancellation")
+                } else {
+                    results.append(StepResult(title: title, state: .ok, detail: "Completed"))
+                    log("[ok] \(title)")
+                }
             } catch {
-                hadErrors = true
-                await log("[error] \(title): \(error.localizedDescription)")
+                if isCancellationRequested {
+                    results.append(StepResult(title: title, state: .cancelled, detail: "Interrupted: \(error.localizedDescription); partial effects may remain"))
+                    log("[cancel] \(title): interrupted: \(error.localizedDescription)")
+                } else {
+                    hadErrors = true
+                    results.append(StepResult(title: title, state: .failed, detail: error.localizedDescription))
+                    log("[error] \(title): \(error.localizedDescription)")
+                }
             }
         }
 
-        await finish()
+        finish(results: results)
+    }
+
+    // MARK: - Shared read-only detectors (preview and repair use the same rules)
+
+    private var zoomHostDomains: [String] {
+        [
+            "zoom.us", "us04web.zoom.us", "us02web.zoom.us",
+            "us06web.zoom.us", "us02ws.zoom.us", "us04ws.zoom.us",
+            "controlplane.zoom.us", "us04mon.zoom.us",
+            "us04stun1.zoom.us", "logcs.zoom.us"
+        ]
+    }
+
+    private func zoomBlockingHostLines(in contents: String) -> [String] {
+        contents.components(separatedBy: .newlines).filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.hasPrefix("#"), !trimmed.isEmpty else { return false }
+            let parts = trimmed.split(separator: " ").map(String.init)
+            guard parts.count >= 2 else { return false }
+            let ip = parts[0]
+            let isBlockEntry = ip == "0.0.0.0" || ip.hasPrefix("127.")
+            let hostsZoom = parts.dropFirst().contains { domain in
+                zoomHostDomains.contains(where: { domain.hasSuffix($0) })
+            }
+            return isBlockEntry && hostsZoom
+        }
+    }
+
+    private func zoomApplicationCandidates() -> [String] {
+        ["/Applications/zoom.us.app", "/Applications/Zoom.app", "/Applications/Zoom Workplace.app"]
+    }
+
+    private func apipaInterfaces(in output: String) -> [String] {
+        var found: [String] = []
+        var current = ""
+        for line in output.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !line.hasPrefix("\t") && !line.hasPrefix(" ") && line.contains(":") {
+                current = String(line.prefix(while: { $0 != ":" }))
+            }
+            if trimmed.hasPrefix("inet 169.254."), !current.isEmpty {
+                found.append(current)
+            }
+        }
+        return found
+    }
+
+    private func zoomInstallationDiscoveryCommand() -> String {
+        """
+        find /Applications "$HOME/Applications" "$HOME/Library/Application Support" -maxdepth 4 -iname "zoom*.app" 2>/dev/null
+        """
     }
 
     // MARK: - System-change detection & repair (Error 1132)
@@ -84,33 +380,10 @@ final class ZoomFixService: ObservableObject {
     /// and remove any lines that point them at 0.0.0.0 / 127.x / a non-Zoom IP.
     private func repairHostsFile() async throws {
         let hostsPath = "/etc/hosts"
-        let zoomDomains = [
-            "zoom.us", "us04web.zoom.us", "us02web.zoom.us",
-            "us06web.zoom.us", "us02ws.zoom.us", "us04ws.zoom.us",
-            "controlplane.zoom.us", "us04mon.zoom.us",
-            "us04stun1.zoom.us", "logcs.zoom.us"
-        ]
-
         let contents = try String(contentsOfFile: hostsPath, encoding: .utf8)
+        let removed = zoomBlockingHostLines(in: contents)
         var lines = contents.components(separatedBy: .newlines)
-        var removed: [String] = []
-
-        lines = lines.filter { line in
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.hasPrefix("#"), !trimmed.isEmpty else { return true }
-            let parts = trimmed.split(separator: " ").map(String.init)
-            guard parts.count >= 2 else { return true }
-            let ip = parts[0]
-            let isBlockEntry = ip == "0.0.0.0" || ip.hasPrefix("127.")
-            let hostsZoom = parts.dropFirst().contains(where: { domain in
-                zoomDomains.contains(where: { domain.hasSuffix($0) })
-            })
-            if isBlockEntry && hostsZoom {
-                removed.append(line)
-                return false
-            }
-            return true
-        }
+        lines.removeAll { removed.contains($0) }
 
         if removed.isEmpty {
             await log("[hosts] No Zoom-blocking entries found in /etc/hosts")
@@ -144,11 +417,7 @@ final class ZoomFixService: ObservableObject {
         let listResult = try await shell.run("\(fwPath) --listapps", allowFailure: true)
         let output = listResult.output
 
-        let zoomBinaries = [
-            "/Applications/zoom.us.app",
-            "/Applications/Zoom.app",
-            "/Applications/Zoom Workplace.app"
-        ]
+        let zoomBinaries = zoomApplicationCandidates()
 
         // Look for BLOCK state on any Zoom binary
         let blockedPattern = #"BLOCK"#
@@ -190,32 +459,18 @@ final class ZoomFixService: ObservableObject {
         let result = try await shell.run("ifconfig -a", allowFailure: true)
         let output = result.output
 
-        // Find interfaces with 169.254.x.x
-        let lines = output.components(separatedBy: .newlines)
-        var apipaInterfaces: [String] = []
-        var currentIface = ""
+        // Find interfaces with 169.254.x.x using the preview's detector.
+        let degradedInterfaces = apipaInterfaces(in: output)
 
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if !line.hasPrefix("\t") && !line.hasPrefix(" ") && line.contains(":") {
-                currentIface = String(line.prefix(while: { $0 != ":" }))
-            }
-            if trimmed.hasPrefix("inet 169.254.") {
-                if !currentIface.isEmpty {
-                    apipaInterfaces.append(currentIface)
-                }
-            }
-        }
-
-        if apipaInterfaces.isEmpty {
+        if degradedInterfaces.isEmpty {
             await log("[network] No APIPA/link-local addresses detected — interfaces look healthy")
             return
         }
 
-        await log("[network] APIPA addresses detected on: \(apipaInterfaces.joined(separator: ", "))")
+        await log("[network] APIPA addresses detected on: \(degradedInterfaces.joined(separator: ", "))")
         await log("[network] Attempting DHCP renewal...")
 
-        for iface in apipaInterfaces {
+        for iface in degradedInterfaces {
             let renewCmd = "ipconfig set \(iface) DHCP"
             let renewResult = try await shell.run(renewCmd, requireAdmin: true, allowFailure: true)
             if renewResult.exitCode == 0 {
@@ -568,10 +823,7 @@ final class ZoomFixService: ObservableObject {
     }
 
     private func findDuplicates() async throws {
-        let command = """
-        find /Applications "$HOME/Applications" "$HOME/Library/Application Support" -maxdepth 4 -iname "zoom*.app" 2>/dev/null
-        """
-        let result = try await shell.run(command, allowFailure: true)
+        let result = try await shell.run(zoomInstallationDiscoveryCommand(), allowFailure: true)
         let paths = result.output
             .split(separator: "\n")
             .map { URL(fileURLWithPath: String($0)) }
@@ -682,13 +934,7 @@ final class ZoomFixService: ObservableObject {
     }
 
     private func verifyInstallation() async throws {
-        let candidates = [
-            "/Applications/zoom.us.app",
-            "/Applications/Zoom.app",
-            "/Applications/Zoom Workplace.app"
-        ]
-
-        for app in candidates where FileManager.default.fileExists(atPath: app) {
+        for app in zoomApplicationCandidates() where FileManager.default.fileExists(atPath: app) {
             await log("Verified install at \(app)")
             await updateStatus(message: "Completed", kind: .success)
             return
@@ -704,7 +950,12 @@ final class ZoomFixService: ObservableObject {
         hadErrors = false
         installerURL = nil
         discoveredInstallations = []
+        adminInstallationPaths = []
         logs = []
+        processRegistry.reset()
+        isCancellationRequested = false
+        cancellationRequested = false
+        lastOutcome = nil
         statusMessage = "Starting..."
         statusKind = .running
         progress = nil
@@ -730,12 +981,38 @@ final class ZoomFixService: ObservableObject {
     }
 
     @MainActor
-    private func finish() {
-        statusKind = hadErrors ? .warning : .success
-        statusMessage = hadErrors ? "Finished with warnings" : "Zoom repaired"
+    private func finish(results: [StepResult]) {
+        let failures = results.filter { $0.state == .failed }
+        let warnings = logs.filter { $0.contains("[warn]") }
+        let completedCount = results.filter { $0.state == .ok || $0.state == .cancelled }.count
+
+        let outcomeState: FixOutcomeState
+        let message: String
+        if isCancellationRequested {
+            outcomeState = .cancelled
+            message = "Cancelled after \(completedCount) of \(results.count) step(s); \(failures.count) failed before cancellation. Partial changes may remain."
+        } else if !failures.isEmpty {
+            outcomeState = .failed
+            message = "Completed with \(failures.count) failed step(s) out of \(results.count). See failures below."
+        } else if hadErrors || !warnings.isEmpty {
+            outcomeState = .completedWithWarnings
+            message = "Completed all \(results.count) step(s) with \(warnings.count) advisory warning(s)."
+        } else {
+            outcomeState = .completed
+            message = "Zoom repaired; all \(results.count) step(s) completed."
+        }
+
+        switch outcomeState {
+        case .completed: statusKind = .success
+        case .cancelled, .completedWithWarnings: statusKind = .warning
+        case .failed: statusKind = .failed
+        }
+        statusMessage = message
         progress = nil
         progressLabel = "Done"
         isRunning = false
+        cancellationRequested = isCancellationRequested
+        lastOutcome = FixOutcome(state: outcomeState, summary: message, results: results, warnings: warnings)
     }
 
     @MainActor

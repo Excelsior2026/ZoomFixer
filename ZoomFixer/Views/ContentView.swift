@@ -14,16 +14,16 @@ struct ContentView: View {
             }
 
             HStack(spacing: 12) {
-                Button(action: viewModel.startFix) {
+                Button(action: viewModel.prepareFixPreview) {
                     HStack {
                         Image(systemName: "wrench.and.screwdriver.fill")
-                        Text(viewModel.isRunning ? "Working..." : "Fix Zoom 1132")
+                        Text(viewModel.isRunning ? "Working..." : "Review Fix...")
                             .bold()
                     }
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(viewModel.isRunning)
+                .disabled(viewModel.isRunning || viewModel.isPreparingPreview || viewModel.isConfirmationPending)
 
                 Button("Quit") {
                     NSApplication.shared.terminate(nil)
@@ -31,17 +31,73 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
             }
 
+            if viewModel.isPreparingPreview {
+                ProgressView("Building change preview (no changes yet)...")
+            } else if viewModel.isConfirmationPending {
+                GroupBox("Preflight preview — nothing has been changed") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Review the changes below, then confirm or cancel. No repair runs until you confirm.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        if viewModel.previewItems.isEmpty {
+                            Text("No state changes detected. The repair will still download and install Zoom.")
+                                .font(.caption)
+                        } else {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(viewModel.previewItems) { item in
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("\(item.kind.rawValue): \(item.target)")
+                                                .font(.system(size: 12, weight: .semibold))
+                                            Text(item.detail)
+                                                .font(.system(size: 11))
+                                                .foregroundColor(.secondary)
+                                                .textSelection(.enabled)
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                                .padding(4)
+                            }
+                            .frame(maxHeight: 200)
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.2)))
+                        }
+
+                        HStack(spacing: 12) {
+                            Button("Confirm and Run") { viewModel.confirmFix() }
+                                .buttonStyle(.borderedProminent)
+                            Button("Cancel") { viewModel.cancelPreview() }
+                                .buttonStyle(.bordered)
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+
             if viewModel.isRunning {
-                if let progress = viewModel.progress {
-                    ProgressView(value: progress, total: 1.0) {
-                        Text(viewModel.progressLabel)
+                HStack(spacing: 12) {
+                    if let progress = viewModel.progress {
+                        ProgressView(value: progress, total: 1.0) {
+                            Text(viewModel.progressLabel)
+                        }
+                        .progressViewStyle(.linear)
+                    } else {
+                        ProgressView {
+                            Text(viewModel.progressLabel)
+                        }
+                        .progressViewStyle(.linear)
                     }
-                    .progressViewStyle(.linear)
-                } else {
-                    ProgressView {
-                        Text(viewModel.progressLabel)
-                    }
-                    .progressViewStyle(.linear)
+
+                    Button("Cancel Repair") { viewModel.cancelFix() }
+                        .buttonStyle(.bordered)
+                        .disabled(viewModel.cancellationRequested)
+                }
+
+                if viewModel.cancellationRequested {
+                    Text("Cancelling: the current command is being stopped. Steps already completed are not automatically rolled back.")
+                        .font(.caption)
+                        .foregroundColor(.orange)
                 }
             }
 
@@ -51,6 +107,60 @@ struct ContentView: View {
                 LogView(entries: viewModel.logs)
                     .frame(maxHeight: 260)
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.2)))
+            }
+
+            if let outcome = viewModel.lastOutcome {
+                GroupBox("Last run outcome") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text(outcome.state.rawValue)
+                                .font(.headline)
+                            Spacer()
+                            Button("Dismiss") { viewModel.clearOutcome() }
+                                .buttonStyle(.borderless)
+                        }
+                        Text(outcome.summary)
+                            .font(.caption)
+                            .textSelection(.enabled)
+
+                        if !outcome.failures.isEmpty {
+                            Text("Failed steps:")
+                                .font(.caption)
+                                .bold()
+                            ForEach(outcome.failures) { result in
+                                Text("• \(result.title): \(result.detail)")
+                                    .font(.caption)
+                                    .foregroundColor(.red)
+                                    .textSelection(.enabled)
+                            }
+                        }
+
+                        if !outcome.warnings.isEmpty {
+                            Text("Advisory warnings:")
+                                .font(.caption)
+                                .bold()
+                            ForEach(outcome.warnings, id: \.self) { warning in
+                                Text("• \(warning)")
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                                    .textSelection(.enabled)
+                            }
+                        }
+
+                        if !outcome.skipped.isEmpty {
+                            Text("Not completed:")
+                                .font(.caption)
+                                .bold()
+                            ForEach(outcome.skipped) { result in
+                                Text("• \(result.title) — \(result.state.rawValue): \(result.detail)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                    .padding(8)
+                }
             }
 
             GroupBox("Sandbox Zoom (Docker)") {
