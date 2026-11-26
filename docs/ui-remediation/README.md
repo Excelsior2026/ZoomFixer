@@ -38,7 +38,7 @@ confirmation, including the privileged install. No step was reduced to a no-op.
 | Role | Owner | What was done |
 | --- | --- | --- |
 | Implementation and static verification | Big Pickle (`opencode/big-pickle`), OpenCode subagent | Source changes, static assertions, Swift parse/typecheck, evidence records |
-| Repository owner / reviewer | Human owner (not contacted in this pass) | Must review locally on a Mac with Xcode and decide on the residual risks in `DECISIONS.md` |
+| Repository owner / reviewer | Human owner (not contacted in this pass) | Must review locally on a Mac with Xcode and decide on the residual risks in `docs/ui-remediation/DECISIONS.md` |
 
 No human review, runtime test, visual test, or build was performed by this
 subagent. No push, merge, PR, deploy, credential use, or production data access
@@ -59,16 +59,16 @@ occurred.
   - `ZoomFixer/Helpers/ShellExecutor.swift`
 - Evidence files:
   - `docs/ui-remediation/README.md` (this file)
-  - `DECISIONS.md`
-  - `VERIFICATION.md`
+  - `docs/ui-remediation/DECISIONS.md`
+  - `docs/ui-remediation/VERIFICATION.md`
 - No project file changes: new Swift types were placed in existing target files
   so `ZoomFixer.xcodeproj/project.pbxproj` was left untouched.
 - Local commits only.
 
 ## Follow-up evidence
 
-- Decisions and rejected alternatives: `DECISIONS.md`
-- Exact commands, results, and blockers: `VERIFICATION.md`
+- Decisions and rejected alternatives: `docs/ui-remediation/DECISIONS.md`
+- Exact commands, results, and blockers: `docs/ui-remediation/VERIFICATION.md`
 
 AI-Model: Big Pickle (opencode/big-pickle)
 AI-Provider: opencode

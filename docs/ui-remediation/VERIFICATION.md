@@ -233,7 +233,7 @@ archive, code-signing, or runtime claim is made.
 - Real system mutation test: intentionally not run; it would alter host
   configuration, firewall, and installed applications.
 - Cancellation under a live privileged prompt: not run. This is the main
-  residual risk (see `DECISIONS.md`, ADR-002).
+  residual risk (see `docs/ui-remediation/DECISIONS.md`, ADR-002).
 - Docker sandbox flows: unchanged and not exercised.
 
 ## Failures encountered and lessons
